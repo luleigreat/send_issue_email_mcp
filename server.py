@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 import re
@@ -20,6 +21,7 @@ import threading
 import time
 from datetime import datetime
 from email.message import EmailMessage
+from html.parser import HTMLParser
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,7 +30,32 @@ from fastmcp import FastMCP
 load_dotenv()
 
 LOG_DIR = Path(__file__).resolve().parent / "log"
+LOG_RETENTION_DAYS = 30
+_LOG_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.log$")
 _logger: logging.Logger | None = None
+
+
+def _purge_old_logs(log_dir: Path, keep_days: int = LOG_RETENTION_DAYS) -> list[str]:
+    """删除早于最近 keep_days 天的 YYYY-MM-DD.log（按文件名日期，含当天共 keep_days 天）。"""
+    if not log_dir.is_dir():
+        return []
+    today = datetime.now().date()
+    deleted: list[str] = []
+    for path in log_dir.glob("*.log"):
+        match = _LOG_NAME_RE.match(path.name)
+        if not match:
+            continue
+        try:
+            file_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if (today - file_date).days >= keep_days:
+            try:
+                path.unlink()
+                deleted.append(path.name)
+            except OSError:
+                continue
+    return deleted
 
 
 class DailyAppendFileHandler(logging.Handler):
@@ -46,12 +73,15 @@ class DailyAppendFileHandler(logging.Handler):
         today = datetime.now().strftime("%Y-%m-%d")
         if self._date == today and self._stream is not None:
             return
+        rolled = self._date is not None and self._date != today
         if self._stream is not None:
             self._stream.close()
             self._stream = None
         path = self.log_dir / f"{today}.log"
         self._stream = open(path, "a", encoding=self.encoding)
         self._date = today
+        if rolled:
+            _purge_old_logs(self.log_dir)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -91,6 +121,9 @@ def _setup_logging() -> logging.Logger:
     sh.setFormatter(fmt)
     logger.addHandler(sh)
     _logger = logger
+    deleted = _purge_old_logs(LOG_DIR)
+    if deleted:
+        logger.info("已删除超过 %s 天的日志: %s", LOG_RETENTION_DAYS, ", ".join(sorted(deleted)))
     return logger
 
 
@@ -116,6 +149,39 @@ def _get_config() -> dict:
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+_BLOCK_TAGS = {
+    "p",
+    "div",
+    "br",
+    "li",
+    "ul",
+    "ol",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "tr",
+    "table",
+    "blockquote",
+    "pre",
+}
+
+
+class _StripHTML(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in _BLOCK_TAGS:
+            self._chunks.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self._chunks.append(data)
+
+    def get_text(self) -> str:
+        return re.sub(r"\n{3,}", "\n\n", "".join(self._chunks)).strip()
 
 
 def _is_email(addr: str) -> bool:
@@ -127,6 +193,68 @@ def _preview(text: str, limit: int = 200) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"...(len={len(text)})"
+
+
+def _split_html_question(question: str) -> tuple[str, str]:
+    """拆出 HTML 前的纯文本前缀（如 [channel=...]）和后续 HTML 片段。"""
+    match = _HTML_TAG_RE.search(question)
+    if not match:
+        return question.strip(), ""
+    prefix = question[: match.start()].strip()
+    html_part = question[match.start() :].strip()
+    return prefix, html_part
+
+
+def _html_to_plain(fragment: str) -> str:
+    parser = _StripHTML()
+    try:
+        parser.feed(fragment)
+        parser.close()
+    except Exception:
+        return _HTML_TAG_RE.sub("", fragment)
+    return parser.get_text()
+
+
+def _plain_to_html(text: str) -> str:
+    escaped = html.escape(text, quote=False)
+    return "<p>" + escaped.replace("\n", "<br>\n") + "</p>"
+
+
+def _build_bodies(email: str, question: str, ts: str) -> tuple[str, str]:
+    """组装纯文本与 HTML 正文。Agent 传入 HTML 时走 text/html，并保留纯文本兜底。"""
+    prefix, html_part = _split_html_question(question)
+    has_html = bool(html_part)
+    question_plain = (
+        (f"{prefix}\n{_html_to_plain(html_part)}" if prefix else _html_to_plain(html_part))
+        if has_html
+        else question
+    )
+    header_plain = (
+        "收到一条用户转人工前提交的问题。\n\n"
+        f"用户邮箱：{email}\n"
+        f"提交时间：{ts}\n"
+        "问题描述：\n"
+    )
+    plain = header_plain + question_plain + "\n"
+
+    question_html = (
+        (
+            (f"<p>{html.escape(prefix)}</p>\n" if prefix else "")
+            + html_part
+        )
+        if has_html
+        else _plain_to_html(question)
+    )
+    html_body = (
+        "<!DOCTYPE html><html><body>"
+        "<p>收到一条用户转人工前提交的问题。</p>"
+        f"<p><strong>用户邮箱：</strong>{html.escape(email)}<br>"
+        f"<strong>提交时间：</strong>{html.escape(ts)}</p>"
+        "<p><strong>问题描述：</strong></p>"
+        f"{question_html}"
+        "</body></html>"
+    )
+    return plain, html_body
 
 
 def _close_smtp_in_background(smtp: smtplib.SMTP) -> None:
@@ -206,18 +334,16 @@ def send_email(email: str, question: str) -> str:
         return "错误：发件人 SENDER_EMAIL / SMTP_USERNAME 未配置。"
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    plain_body, html_body = _build_bodies(email, question, ts)
+    has_html = bool(_split_html_question(question)[1])
     msg = EmailMessage()
     msg["Subject"] = f"[问题收集] 来自用户 {email} ({ts})"
     msg["From"] = f"{cfg['sender_name']} <{cfg['sender']}>"
     msg["To"] = cfg["target"]
     msg["Reply-To"] = email
-    msg.set_content(
-        "收到一条用户转人工前提交的问题。\n\n"
-        f"用户邮箱：{email}\n"
-        f"提交时间：{ts}\n"
-        f"问题描述：\n{question}\n"
-    )
-    log.debug("邮件已组装 subject=%s", msg["Subject"])
+    msg.set_content(plain_body)
+    msg.add_alternative(html_body, subtype="html")
+    log.debug("邮件已组装 subject=%s html=%s", msg["Subject"], has_html)
 
     smtp: smtplib.SMTP | None = None
     try:
