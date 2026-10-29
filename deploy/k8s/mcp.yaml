@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: send-issue-email-logs
+  namespace: send-issue-email
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: send-issue-email
+  namespace: send-issue-email
+spec:
+  # Logs sit on a ReadWriteOnce volume. Keep this at 1.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: send-issue-email
+  template:
+    metadata:
+      labels:
+        app: send-issue-email
+    spec:
+      securityContext:
+        fsGroup: 10001
+      initContainers:
+        - name: init-logs
+          image: send-issue-email:replace-me
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "mkdir -p /app/log && chown 10001:10001 /app/log && chmod 755 /app/log"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: logs
+              mountPath: /app/log
+      containers:
+        - name: mcp
+          image: send-issue-email:replace-me
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8765
+          envFrom:
+            - configMapRef:
+                name: send-issue-email-config
+            - secretRef:
+                name: send-issue-email-secret
+          volumeMounts:
+            - name: logs
+              mountPath: /app/log
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8765
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8765
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: send-issue-email-logs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: send-issue-email
+  namespace: send-issue-email
+spec:
+  type: ClusterIP
+  selector:
+    app: send-issue-email
+  ports:
+    - port: 8765
+      targetPort: 8765

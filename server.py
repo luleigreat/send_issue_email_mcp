@@ -132,6 +132,14 @@ log = _setup_logging()
 mcp = FastMCP("issue-collector")
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request):
+    """给部署探针用。MCP 协议仍在 POST /，这条只表示进程活着。"""
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({"status": "ok"})
+
+
 def _get_config() -> dict:
     target = os.getenv("TARGET_EMAIL")
     if not target:
