@@ -1,20 +1,44 @@
 apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: send-issue-email-logs-pv
+spec:
+  accessModes:
+    - ReadWriteOnce
+  capacity:
+    storage: 10Gi
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    name: send-issue-email-logs
+    namespace: arko
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: fs-0d780520367abc72b
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: efs-sc
+  volumeMode: Filesystem
+---
+apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: send-issue-email-logs
-  namespace: send-issue-email
+  namespace: arko
 spec:
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 1Gi
+      storage: 10Gi
+  storageClassName: efs-sc
+  volumeMode: Filesystem
+  volumeName: send-issue-email-logs-pv
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: send-issue-email
-  namespace: send-issue-email
+  namespace: arko
 spec:
   # Logs sit on a ReadWriteOnce volume. Keep this at 1.
   replicas: 1
@@ -69,7 +93,8 @@ spec:
               cpu: 50m
               memory: 128Mi
             limits:
-              memory: 512Mi
+              cpu: 2
+              memory: 2048Mi
       volumes:
         - name: logs
           persistentVolumeClaim:
@@ -79,7 +104,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: send-issue-email
-  namespace: send-issue-email
+  namespace: arko
 spec:
   type: NodePort
   selector:
