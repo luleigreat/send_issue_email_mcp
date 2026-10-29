@@ -23,7 +23,7 @@ ECR 里需要一个仓库：`send-issue-email`。
 
 ## 对外入口
 
-8765 只在集群内部。不要给这个服务做公网 Ingress。进程没有登录，也没有 Bearer 校验，知道地址就能发信。
+Service 是 NodePort，节点端口 `30404`，容器端口仍是 `8765`。不要再给这个服务做公网 Ingress。进程没有登录，也没有 Bearer 校验，知道地址就能发信。
 
 `arko-chat-agent` 和本服务在同一集群时，后台「MCP」填：
 

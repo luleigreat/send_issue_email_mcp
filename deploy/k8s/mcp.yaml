@@ -81,9 +81,10 @@ metadata:
   name: send-issue-email
   namespace: send-issue-email
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app: send-issue-email
   ports:
     - port: 8765
       targetPort: 8765
+      nodePort: 30404
