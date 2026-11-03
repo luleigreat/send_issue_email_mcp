@@ -4,7 +4,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: send-issue-email-config
-  namespace: send-issue-email
+  namespace: arko
 data:
   TARGET_EMAIL: services@arko.global
   SMTP_HOST: smtp.larksuite.com

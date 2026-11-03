@@ -83,6 +83,7 @@ MCP_PATH=/
 | `MCP_HOST` | 监听地址，远程填 `0.0.0.0` |
 | `MCP_PORT` | 监听端口。本机 `8000` 常被其他项目占用，可用 `8765` |
 | `MCP_PATH` | HTTP 端点路径。智齿必须是 `/` |
+| `MCP_AUTH_TOKEN` | HTTP 模式必填。请求带 `Authorization: Bearer <该值>`。为空时拒绝启动。stdio 不读 |
 
 改完 `.env` 后，若终端里已经 `export` 过同名变量，`load_dotenv()` **不会覆盖**。新开终端，或先 `unset MCP_TRANSPORT TARGET_EMAIL` 再启动。
 
@@ -93,7 +94,7 @@ source .venv/bin/activate
 python test_email.py
 ```
 
-成功会打印：`成功：问题已发送至服务邮箱 ...`
+成功会打印：`成功：问题已发送。`
 
 脚本里的第一个参数是**模拟用户联系邮箱**，不是发件人。建议改成你自己的真实邮箱再测，避免 `example.com` 被收件方拦进垃圾箱。
 
@@ -134,9 +135,12 @@ http://<这台机器的可达地址>:<MCP_PORT>/
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8765/ \
+  -H "Authorization: Bearer <MCP_AUTH_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"check","version":"0.0.1"}}}'
 ```
+
+不带令牌或令牌错误时返回 `401`，正文 `Unauthorized`。`GET /health` 不需要令牌。
 
 正常返回带 `"jsonrpc":"2.0"` 和 `"serverInfo":{"name":"issue-collector"...}` 的 JSON。
 

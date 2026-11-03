@@ -23,57 +23,69 @@ ECR 里需要一个仓库：`send-issue-email`。
 
 ## 对外入口
 
-Service 是 NodePort，节点端口 `30404`，容器端口仍是 `8765`。不要再给这个服务做公网 Ingress。进程没有登录，也没有 Bearer 校验，知道地址就能发信。
+Service 是 NodePort，节点端口 `30404`，容器端口仍是 `8765`。不要再给这个服务做公网 Ingress。`POST /` 必须带 `Authorization: Bearer <MCP_AUTH_TOKEN>`，令牌和 `arko-chat-agent` 后台的 MCP Token 用同一个值。`GET /health` 不校验，探针不用带令牌。
 
-`arko-chat-agent` 和本服务在同一集群时，后台「MCP」填：
+工作负载在命名空间 `arko`。`arko-chat-agent` 和本服务在同一集群时，后台「MCP」填：
 
 ```text
-http://send-issue-email.send-issue-email.svc.cluster.local:8765/
+http://send-issue-email.arko.svc.cluster.local:8765/
 ```
 
-末尾的 `/` 要留着。工具名填 `send_issue_email`。本服务不校验 Token，后台的 MCP Token 留空。
+末尾的 `/` 要留着。工具名填 `send_issue_email`。后台的 MCP Token 填和 Secret 里 `MCP_AUTH_TOKEN` 相同的值。留空时客服发信会全部 401。
 
-出网要能连配置里的 SMTP。Gmail 是 `smtp.gmail.com:465`。
+出网要能连 `smtp.larksuite.com:465`（SSL）。
 
 ## 安全
 
 容器端口不是公网端口。外网不应该直接打到 8765。`arko-chat-agent` 从集群内部调用。
 
-密钥不要打进镜像。`SMTP_USERNAME` 和 `SMTP_PASSWORD` 只放在 `send-issue-email-secret`。Gmail 填应用专用密码，不是登录密码。
+密钥不要打进镜像。`SMTP_USERNAME`、`SMTP_PASSWORD` 和 `MCP_AUTH_TOKEN` 只放在 `arko` 命名空间的 `send-issue-email-secret`。SMTP 密码是飞书邮箱的 SMTP 密码。HTTP 模式下令牌为空时进程拒绝启动。stdio 模式不读这个令牌。
 
 ## 配置
 
-本地 `.env` 的键与集群配置的对应关系如下。
+本地 `.env` 的键与集群配置的对应关系如下。非密钥的当前值在 `deploy/k8s/configmap.yaml`。
 
-| `.env` | 放到 | 说明 |
+| `.env` | 放到 | 当前值 |
 |---|---|---|
-| `SMTP_USERNAME` | `send-issue-email-secret` | 登录 SMTP 的账号 |
-| `SMTP_PASSWORD` | `send-issue-email-secret` | SMTP 密码或 Gmail 应用专用密码 |
-| `TARGET_EMAIL` | `send-issue-email-config` | 固定收件邮箱。调用方改不了 |
-| `SMTP_HOST` | `send-issue-email-config` | 例如 `smtp.gmail.com` |
-| `SMTP_PORT` | `send-issue-email-config` | SSL 用 `465` |
-| `SMTP_USE_SSL` | `send-issue-email-config` | `true` 为 SSL（465）；`false` 为 STARTTLS（587） |
-| `SENDER_EMAIL` | `send-issue-email-config` | 发件人，通常等于 `SMTP_USERNAME` |
-| `SENDER_NAME` | `send-issue-email-config` | 发件显示名 |
-| `MCP_TRANSPORT` | `send-issue-email-config` | 保持 `streamable-http` |
-| `MCP_HOST` | `send-issue-email-config` | 保持 `0.0.0.0` |
-| `MCP_PORT` | `send-issue-email-config` | 保持 `8765` |
-| `MCP_PATH` | `send-issue-email-config` | 保持 `/`。改掉后 `arko-chat-agent` 的 `POST` 会对不上 |
+| `SMTP_USERNAME` | `send-issue-email-secret` | `agent@arko.global` |
+| `SMTP_PASSWORD` | `send-issue-email-secret` | 飞书 SMTP 密码，只放 Secret |
+| `MCP_AUTH_TOKEN` | `send-issue-email-secret` | 一长串随机值。与后台 MCP Token 相同。HTTP 模式为空时进程拒绝启动 |
+| `TARGET_EMAIL` | `send-issue-email-config` | `services@arko.global`。调用方改不了 |
+| `SMTP_HOST` | `send-issue-email-config` | `smtp.larksuite.com` |
+| `SMTP_PORT` | `send-issue-email-config` | `465` |
+| `SMTP_USE_SSL` | `send-issue-email-config` | `true`（465 SSL）。`false` 为 STARTTLS（587） |
+| `SENDER_EMAIL` | `send-issue-email-config` | `agent@arko.global` |
+| `SENDER_NAME` | `send-issue-email-config` | `ARKO Chat Agent` |
+| `MCP_TRANSPORT` | `send-issue-email-config` | `streamable-http` |
+| `MCP_HOST` | `send-issue-email-config` | `0.0.0.0` |
+| `MCP_PORT` | `send-issue-email-config` | `8765` |
+| `MCP_PATH` | `send-issue-email-config` | `/`。改掉后 `arko-chat-agent` 的 `POST` 会对不上 |
+
+Secret 在命名空间 `arko`，至少包含这三项：
+
+```yaml
+stringData:
+  SMTP_USERNAME: agent@arko.global
+  SMTP_PASSWORD: <飞书 SMTP 密码>
+  MCP_AUTH_TOKEN: <与后台 MCP Token 相同>
+```
+
+`deploy/k8s/kustomization.yaml` 里的 `namespace` 仍是 `send-issue-email`。执行 `kubectl apply -k` 前改成 `arko`，否则 Kustomize 会把 ConfigMap 和 Deployment 改到 `send-issue-email`。
 
 改配置：
 
 ```bash
-kubectl -n send-issue-email edit configmap send-issue-email-config
-kubectl -n send-issue-email edit secret send-issue-email-secret
-kubectl -n send-issue-email rollout restart deployment/send-issue-email
+kubectl -n arko edit configmap send-issue-email-config
+kubectl -n arko edit secret send-issue-email-secret
+kubectl -n arko rollout restart deployment/send-issue-email
 ```
 
 Secret 和 ConfigMap 都要重启后才进进程。
 
 ## 第一次部署
 
-1. 按上面的表填 `deploy/k8s/secret.example.yaml`，另存为 `deploy/k8s/secret.yaml`。这个文件不要提交。
-2. 把 `deploy/k8s/configmap.yaml` 里的 `TARGET_EMAIL`、`SENDER_EMAIL` 和 SMTP 主机改成真实值。
+1. 按上面的表填 `deploy/k8s/secret.example.yaml`，另存为 `deploy/k8s/secret.yaml`。命名空间用 `arko`。`MCP_AUTH_TOKEN` 换成随机值，并填进 `arko-chat-agent` 后台的 MCP Token。这个文件不要提交。
+2. `deploy/k8s/configmap.yaml` 已是当前飞书发信配置。要改收件人或发件人时改这一份。
 3. 把 `deploy/k8s/kustomization.yaml` 里的 `newTag` 改成刚才构建的 `TAG`。镜像在 ECR 时，给这一项加上 `newName`，例如 `ACCOUNT.dkr.ecr.REGION.amazonaws.com/send-issue-email`。
 4. 执行：
 
@@ -85,14 +97,14 @@ kubectl apply -k deploy/k8s
 看进程：
 
 ```bash
-kubectl -n send-issue-email get pods
-kubectl -n send-issue-email logs deploy/send-issue-email
-kubectl -n send-issue-email exec deploy/send-issue-email -- python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/health').read().decode())"
+kubectl -n arko get pods
+kubectl -n arko logs deploy/send-issue-email
+kubectl -n arko exec deploy/send-issue-email -- python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/health').read().decode())"
 ```
 
 `/health` 返回 `{"status":"ok"}` 只说明进程活着，不说明 SMTP 能登录。
 
-然后在 `arko-chat-agent` 管理端把 MCP 地址改成上一节那个集群地址，工具名 `send_issue_email`，Token 留空。用调试对话留一个邮箱，确认本服务日志里出现 `SMTP send_message 成功`。
+然后在 `arko-chat-agent` 管理端把 MCP 地址改成上一节那个集群地址，工具名 `send_issue_email`，Token 填和 Secret 里 `MCP_AUTH_TOKEN` 相同的值。用调试对话留一个邮箱，确认本服务日志里出现 `SMTP send_message 成功`。不带令牌访问 `GET /health` 仍应返回 `{"status":"ok"}`。
 
 ## 日常动作
 
@@ -101,11 +113,11 @@ kubectl -n send-issue-email exec deploy/send-issue-email -- python -c "import ur
 看日志。标准输出是 INFO。按天的明细在容器 `/app/log/YYYY-MM-DD.log`，启动时会删掉超过 30 天的文件。
 
 ```bash
-kubectl -n send-issue-email logs -f deploy/send-issue-email
-kubectl -n send-issue-email exec deploy/send-issue-email -- ls /app/log
+kubectl -n arko logs -f deploy/send-issue-email
+kubectl -n arko exec deploy/send-issue-email -- ls /app/log
 ```
 
-不要把副本调到 1 以上。日志盘是 ReadWriteOnce，默认 1Gi，用集群的默认 StorageClass。要指定存储类时，在 PVC 上加 `storageClassName`。
+不要把副本调到 1 以上。日志盘是 ReadWriteOnce 的 10Gi EFS（`storageClassName: efs-sc`，PV `send-issue-email-logs-pv`）。
 
 删掉这块 PVC 会丢掉还没过期的日志，不会丢掉已经发出去的邮件。邮件在收件邮箱里。
 

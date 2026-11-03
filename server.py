@@ -9,16 +9,18 @@
 
 from __future__ import annotations
 
+import hmac
 import html
 import logging
 import os
+import queue
 import re
 import smtplib
-import socket
 import ssl
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from email.message import EmailMessage
 from html.parser import HTMLParser
@@ -31,7 +33,16 @@ load_dotenv()
 
 LOG_DIR = Path(__file__).resolve().parent / "log"
 LOG_RETENTION_DAYS = 30
+_MAX_LOG_RECORD = 8 * 1024
+_MAX_LOG_BYTES = 64 * 1024 * 1024
+_MAX_EMAIL_LEN = 254
+_MAX_QUESTION_LEN = 10000
+_MAX_SEND_CONCURRENCY = 4
+_SEND_WINDOW_SECONDS = 60
+_SEND_WINDOW_LIMIT = 10
+_CLOSE_QUEUE_MAX = 32
 _LOG_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.log$")
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _logger: logging.Logger | None = None
 
 
@@ -67,6 +78,8 @@ class DailyAppendFileHandler(logging.Handler):
         self.encoding = encoding
         self._date: str | None = None
         self._stream = None
+        self._bytes = 0
+        self._cap_warned = False
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
     def _ensure_stream(self) -> None:
@@ -79,6 +92,8 @@ class DailyAppendFileHandler(logging.Handler):
             self._stream = None
         path = self.log_dir / f"{today}.log"
         self._stream = open(path, "a", encoding=self.encoding)
+        self._bytes = path.stat().st_size
+        self._cap_warned = self._bytes >= _MAX_LOG_BYTES
         self._date = today
         if rolled:
             _purge_old_logs(self.log_dir)
@@ -87,8 +102,18 @@ class DailyAppendFileHandler(logging.Handler):
         try:
             self._ensure_stream()
             assert self._stream is not None
-            self._stream.write(self.format(record) + "\n")
+            line = self.format(record) + "\n"
+            encoded = line.encode(self.encoding, errors="replace")
+            if len(encoded) > _MAX_LOG_RECORD:
+                encoded = encoded[:_MAX_LOG_RECORD] + b"\n"
+            if self._bytes + len(encoded) > _MAX_LOG_BYTES:
+                if not self._cap_warned:
+                    self._cap_warned = True
+                    sys.stderr.write("当天日志已达 64MiB，后续记录丢弃\n")
+                return
+            self._stream.buffer.write(encoded)
             self._stream.flush()
+            self._bytes += len(encoded)
         except Exception:
             self.handleError(record)
 
@@ -157,7 +182,9 @@ def _get_config() -> dict:
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^<>]*>")
+_ALLOWED_TAGS = {"p", "br", "strong", "b", "ul", "ol", "li"}
+_DROP_TAGS = {"script", "iframe", "style", "a"}
 _BLOCK_TAGS = {
     "p",
     "div",
@@ -193,11 +220,13 @@ class _StripHTML(HTMLParser):
 
 
 def _is_email(addr: str) -> bool:
-    return bool(addr) and bool(_EMAIL_RE.match(addr))
+    return bool(addr) and len(addr) <= _MAX_EMAIL_LEN and bool(_EMAIL_RE.match(addr))
 
 
 def _preview(text: str, limit: int = 200) -> str:
-    text = text.replace("\n", "\\n")
+    if not isinstance(text, str):
+        text = str(text)
+    text = _CTRL_RE.sub(lambda m: f"\\x{ord(m.group(0)):02x}", text)
     if len(text) <= limit:
         return text
     return text[:limit] + f"...(len={len(text)})"
@@ -211,6 +240,59 @@ def _split_html_question(question: str) -> tuple[str, str]:
     prefix = question[: match.start()].strip()
     html_part = question[match.start() :].strip()
     return prefix, html_part
+
+
+class _SanitizeHTML(HTMLParser):
+    """只保留排版标签。script/iframe/style/a 整段丢掉，其余标签去掉、文本转义。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._out: list[str] = []
+        self._drop_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        if self._drop_depth:
+            if tag in _DROP_TAGS:
+                self._drop_depth += 1
+            return
+        if tag in _DROP_TAGS:
+            self._drop_depth = 1
+            return
+        if tag == "img":
+            return
+        if tag in _ALLOWED_TAGS:
+            self._out.append("<br>" if tag == "br" else f"<{tag}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self._drop_depth:
+            if tag in _DROP_TAGS:
+                self._drop_depth -= 1
+            return
+        if tag in _ALLOWED_TAGS and tag != "br":
+            self._out.append(f"</{tag}>")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_data(self, data: str) -> None:
+        if self._drop_depth:
+            return
+        self._out.append(html.escape(data, quote=False))
+
+    def get_html(self) -> str:
+        return "".join(self._out)
+
+
+def _sanitize_html(fragment: str) -> str:
+    parser = _SanitizeHTML()
+    try:
+        parser.feed(fragment)
+        parser.close()
+    except Exception:
+        return html.escape(fragment, quote=False)
+    return parser.get_html()
 
 
 def _html_to_plain(fragment: str) -> str:
@@ -248,7 +330,7 @@ def _build_bodies(email: str, question: str, ts: str) -> tuple[str, str]:
     question_html = (
         (
             (f"<p>{html.escape(prefix)}</p>\n" if prefix else "")
-            + html_part
+            + _sanitize_html(html_part)
         )
         if has_html
         else _plain_to_html(question)
@@ -265,10 +347,12 @@ def _build_bodies(email: str, question: str, ts: str) -> tuple[str, str]:
     return plain, html_body
 
 
-def _close_smtp_in_background(smtp: smtplib.SMTP) -> None:
-    """send_message 成功后立刻返回；QUIT/SSL 关闭放到后台，避免卡住 MCP 响应。"""
+_close_queue: queue.Queue[smtplib.SMTP] = queue.Queue(maxsize=_CLOSE_QUEUE_MAX)
 
-    def _run() -> None:
+
+def _smtp_closer() -> None:
+    while True:
+        smtp = _close_queue.get()
         t0 = time.monotonic()
         log.info("后台关闭 SMTP 开始 id=%s", id(smtp))
         try:
@@ -282,7 +366,43 @@ def _close_smtp_in_background(smtp: smtplib.SMTP) -> None:
             except Exception as e2:
                 log.warning("后台 SMTP close 失败 id=%s err=%s", id(smtp), e2)
 
-    threading.Thread(target=_run, name="smtp-close", daemon=True).start()
+
+threading.Thread(target=_smtp_closer, name="smtp-close", daemon=True).start()
+
+
+def _close_smtp_in_background(smtp: smtplib.SMTP) -> None:
+    """send_message 成功后立刻返回。连接关闭交给单个后台线程。"""
+    try:
+        _close_queue.put_nowait(smtp)
+    except queue.Full:
+        log.warning("关闭队列已满，改为当前线程 close id=%s", id(smtp))
+        try:
+            smtp.close()
+        except Exception as e:
+            log.warning("同步 close 失败 id=%s err=%s", id(smtp), e)
+
+
+_send_slots = threading.BoundedSemaphore(_MAX_SEND_CONCURRENCY)
+_send_times: deque[float] = deque()
+_send_lock = threading.Lock()
+
+
+def _acquire_send_permit() -> str | None:
+    if not _send_slots.acquire(blocking=False):
+        return "错误：发信繁忙，请稍后再试。"
+    now = time.monotonic()
+    with _send_lock:
+        while _send_times and now - _send_times[0] > _SEND_WINDOW_SECONDS:
+            _send_times.popleft()
+        if len(_send_times) >= _SEND_WINDOW_LIMIT:
+            _send_slots.release()
+            return "错误：发信过于频繁，请稍后再试。"
+        _send_times.append(now)
+    return None
+
+
+def _release_send_permit() -> None:
+    _send_slots.release()
 
 
 def _open_smtp(cfg: dict) -> smtplib.SMTP:
@@ -290,7 +410,9 @@ def _open_smtp(cfg: dict) -> smtplib.SMTP:
     t0 = time.monotonic()
     if cfg["use_ssl"]:
         log.info("SMTP_SSL 连接中 host=%s port=%s timeout=15", host, port)
-        conn: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=15)
+        conn: smtplib.SMTP = smtplib.SMTP_SSL(
+            host, port, timeout=15, context=ssl.create_default_context()
+        )
         log.info("SMTP_SSL 已连接 elapsed=%.3fs", time.monotonic() - t0)
         return conn
     log.info("SMTP STARTTLS 连接中 host=%s port=%s timeout=15", host, port)
@@ -306,23 +428,29 @@ def send_email(email: str, question: str) -> str:
     send_message 成功后立即返回 MCP 结果，连接关闭在后台线程进行。
     """
     t_all = time.monotonic()
+    if len(email or "") > _MAX_EMAIL_LEN:
+        log.warning("用户邮箱过长 len=%s", len(email))
+        return "错误：用户邮箱格式无效。"
+    if len(question or "") > _MAX_QUESTION_LEN:
+        log.warning("问题描述过长 len=%s", len(question))
+        return "错误：问题描述过长。"
     log.info(
         "开始发信 user_email=%s question=%s",
-        email,
+        _preview(email or ""),
         _preview(question or ""),
     )
     if not email or not question:
         log.warning("参数为空 email_empty=%s question_empty=%s", not email, not question)
         return "错误：邮箱和问题均不能为空。"
     if not _is_email(email):
-        log.warning("用户邮箱格式无效 email=%s", email)
-        return f"错误：用户邮箱格式无效：{email}"
+        log.warning("用户邮箱格式无效 email=%s", _preview(email))
+        return "错误：用户邮箱格式无效。"
 
     try:
         cfg = _get_config()
     except ValueError as e:
         log.error("读取配置失败: %s", e)
-        return f"错误：{e}"
+        return "错误：邮件服务未正确配置。"
 
     log.info(
         "SMTP 配置 host=%s port=%s ssl=%s user=%s sender=%s target=%s",
@@ -335,11 +463,11 @@ def send_email(email: str, question: str) -> str:
     )
 
     if not _is_email(cfg["target"]):
-        log.warning("目标服务邮箱格式无效 target=%s", cfg["target"])
-        return f"错误：目标服务邮箱格式无效：{cfg['target']}"
+        log.warning("目标服务邮箱格式无效 target=%s", _preview(cfg["target"]))
+        return "错误：邮件服务未正确配置。"
     if not cfg["sender"]:
         log.error("发件人未配置")
-        return "错误：发件人 SENDER_EMAIL / SMTP_USERNAME 未配置。"
+        return "错误：邮件服务未正确配置。"
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     plain_body, html_body = _build_bodies(email, question, ts)
@@ -351,9 +479,13 @@ def send_email(email: str, question: str) -> str:
     msg["Reply-To"] = email
     msg.set_content(plain_body)
     msg.add_alternative(html_body, subtype="html")
-    log.debug("邮件已组装 subject=%s html=%s", msg["Subject"], has_html)
+    log.debug("邮件已组装 subject=%s html=%s", _preview(str(msg["Subject"])), has_html)
 
     smtp: smtplib.SMTP | None = None
+    denied = _acquire_send_permit()
+    if denied:
+        log.warning("发信被限流: %s", denied)
+        return denied
     try:
         smtp = _open_smtp(cfg)
         if cfg["username"] and cfg["password"]:
@@ -372,13 +504,15 @@ def send_email(email: str, question: str) -> str:
         )
         _close_smtp_in_background(smtp)
         smtp = None
-        return f"成功：问题已发送至服务邮箱 {cfg['target']}。"
-    except (smtplib.SMTPException, socket.error, ssl.SSLError, TimeoutError, OSError) as e:
+        return "成功：问题已发送。"
+    except Exception as e:
         log.exception("邮件发送失败 elapsed=%.3fs err=%s", time.monotonic() - t_all, e)
         if smtp is not None:
             _close_smtp_in_background(smtp)
             smtp = None
-        return f"错误：邮件发送失败 - {e}"
+        return "错误：邮件发送失败。"
+    finally:
+        _release_send_permit()
 
 
 @mcp.tool()
@@ -391,7 +525,7 @@ def send_issue_email(email: str, question: str) -> str:
     """
     log.info("MCP 工具 send_issue_email 被调用")
     result = send_email(email, question)
-    log.info("MCP 工具返回: %s", result)
+    log.info("MCP 工具返回: %s", _preview(result))
     return result
 
 
@@ -430,7 +564,12 @@ class _AcceptCompatMiddleware:
         client = scope.get("client")
         t0 = time.monotonic()
         status_code: int | None = None
-        log.info("HTTP 请求开始 method=%s path=%s client=%s", method, path, client)
+        log.info(
+            "HTTP 请求开始 method=%s path=%s client=%s",
+            _preview(str(method)),
+            _preview(str(path)),
+            client,
+        )
 
         async def send_wrapper(message):
             nonlocal status_code
@@ -443,19 +582,68 @@ class _AcceptCompatMiddleware:
         except Exception:
             log.exception(
                 "HTTP 请求异常 method=%s path=%s elapsed=%.3fs",
-                method,
-                path,
+                _preview(str(method)),
+                _preview(str(path)),
                 time.monotonic() - t0,
             )
             raise
         finally:
             log.info(
                 "HTTP 请求结束 method=%s path=%s status=%s elapsed=%.3fs",
-                method,
-                path,
+                _preview(str(method)),
+                _preview(str(path)),
                 status_code,
                 time.monotonic() - t0,
             )
+
+
+class _BearerAuthMiddleware:
+    """HTTP 模式必须带 Bearer。GET /health 留给探针。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method") or ""
+        path = scope.get("path") or ""
+        if len(path) > 1 and path.endswith("/"):
+            path = path.rstrip("/")
+        if method == "GET" and path == "/health":
+            await self.app(scope, receive, send)
+            return
+
+        expected = os.getenv("MCP_AUTH_TOKEN", "").strip()
+        presented = ""
+        for key, value in scope.get("headers") or []:
+            if key == b"authorization":
+                presented = value.decode("latin-1")
+                break
+        got = presented[7:] if presented.startswith("Bearer ") else ""
+        if not expected or not got or not hmac.compare_digest(got, expected):
+            log.warning(
+                "HTTP 鉴权失败 method=%s path=%s",
+                _preview(method),
+                _preview(path),
+            )
+            body = b"Unauthorized"
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"text/plain; charset=utf-8"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        await self.app(scope, receive, send)
 
 
 if __name__ == "__main__":
@@ -476,6 +664,9 @@ if __name__ == "__main__":
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:
+        if not os.getenv("MCP_AUTH_TOKEN", "").strip():
+            log.error("MCP_AUTH_TOKEN 未配置，拒绝以 HTTP 方式启动")
+            raise SystemExit(1)
         # 智齿对配置的 URL 发 POST /，必须把 MCP 挂在根路径，并用 JSON 响应。
         mcp.run(
             transport=transport,
@@ -484,5 +675,8 @@ if __name__ == "__main__":
             path=path,
             json_response=True,
             stateless_http=True,
-            middleware=[Middleware(_AcceptCompatMiddleware)],
+            middleware=[
+                Middleware(_BearerAuthMiddleware),
+                Middleware(_AcceptCompatMiddleware),
+            ],
         )
