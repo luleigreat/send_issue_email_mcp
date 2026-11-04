@@ -122,3 +122,25 @@ kubectl -n arko exec deploy/send-issue-email -- ls /app/log
 删掉这块 PVC 会丢掉还没过期的日志，不会丢掉已经发出去的邮件。邮件在收件邮箱里。
 
 一次发信含 SMTP 往返，常见要数秒到十几秒。`arko-chat-agent` 等待 MCP 的时间要盖住这段，不要只留几秒。
+
+## 安全扫描修复相关
+
+HTTP 模式新增 `MCP_AUTH_TOKEN`。调用方请求要带 `Authorization: Bearer <MCP_AUTH_TOKEN>`。值为空时进程拒绝启动。`GET /health` 不校验。stdio 模式不读这项。
+
+生成一串随机值：
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+填在哪：
+集群 Secret `send-issue-email-secret`（命名空间 `arko`）的 `MCP_AUTH_TOKEN`。
+
+Secret 改完后重启：
+
+```bash
+kubectl -n arko edit secret send-issue-email-secret
+kubectl -n arko rollout restart deployment/send-issue-email
+```
+
+后台 Token 留空时，客服发信会全部 401。
