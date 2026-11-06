@@ -616,12 +616,22 @@ class _BearerAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        headers = scope.get("headers") or []
+        names = [key.decode("latin-1", errors="replace") for key, _ in headers]
+        auth_values = [
+            value.decode("latin-1", errors="replace")
+            for key, value in headers
+            if key == b"authorization"
+        ]
+        log.info(
+            "HTTP 鉴权头 method=%s path=%s header_names=%s authorization=%s",
+            _preview(method),
+            _preview(path),
+            _preview(",".join(names)),
+            _preview(repr(auth_values)),
+        )
         expected = os.getenv("MCP_AUTH_TOKEN", "").strip()
-        presented = ""
-        for key, value in scope.get("headers") or []:
-            if key == b"authorization":
-                presented = value.decode("latin-1")
-                break
+        presented = auth_values[0] if auth_values else ""
         got = presented[7:] if presented.startswith("Bearer ") else ""
         if not expected or not got or not hmac.compare_digest(got, expected):
             log.warning(
